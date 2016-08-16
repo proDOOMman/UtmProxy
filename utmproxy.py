@@ -3,6 +3,7 @@
 import io
 import re
 import sched
+import sys
 import threading
 import time
 import os
@@ -27,6 +28,7 @@ from twisted.web import http
 from sqlalchemy import Column, DateTime, String, Integer, Boolean, Binary, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import create_engine
+from sqlalchemy import desc
 from sqlalchemy.orm import scoped_session
 from sqlalchemy.orm import sessionmaker
 
@@ -54,6 +56,8 @@ class UtmDocument(Base):
 
 
 engine = create_engine('sqlite:///' + dir_path + '\\utmproxy.db')
+# MSSQL:
+# engine = create_engine('mssql+pymssql://user:password@server/database?charset=utf8')
 session_factory = sessionmaker(bind=engine)
 session = scoped_session(session_factory)
 Base.metadata.create_all(engine)
@@ -143,62 +147,149 @@ class ProxyRequest(http.Request):
         self_port = self.host.port
 
         if self.path.startswith(b"/opt/out"):
-            s = session()
-            self.setResponseCode(http.OK)
-            self.setHeader("Content-Type", "text/xml;charset=utf-8")
-            now = datetime.now()
-            stamp = mktime(now.timetuple())
-            self.setHeader("Date", format_date_time(stamp))
-            self.setHeader("Server", "UTM cached proxy")
             if self.path == b"/opt/out" or self.path == b"/opt/out/":
+                s = session()
+                self.setResponseCode(http.OK)
+                self.setHeader("Content-Type", "text/xml;charset=utf-8")
+                now = datetime.now()
+                stamp = mktime(now.timetuple())
+                self.setHeader("Date", format_date_time(stamp))
+                self.setHeader("Server", "UTM cached proxy")
+
                 limit = int(self.args.get(b'limit', [0])[0])
                 offset = int(self.args.get(b'offset', [0])[0])
                 archived = self.args.get(b'archived', [b'0'])[0] == b'1'
+                reply_id = self.args.get(b'replyId', [None])[0]
                 if archived is True and limit == 0:
                     limit = 500
                 top = Element('A')
-                query = s.query(UtmDocument).filter(UtmDocument.archived == archived,
-                                                    UtmDocument.documentType != "request").order_by(UtmDocument.id)
+                query = s.query(UtmDocument)
+                if reply_id is not None:
+                    query = query.filter(UtmDocument.replyId == reply_id)
+                else:
+                    query = query.filter(UtmDocument.archived == archived,
+                                         UtmDocument.documentType != "request")
+                if archived:
+                    query = query.order_by(desc(UtmDocument.id))
+                else:
+                    query = query.order_by(UtmDocument.id)
                 if limit > 0:
                     query = query.limit(limit)
                 if offset > 0:
                     query = query.offset(offset)
                 for doc in query.all():
                     child = SubElement(top, 'url')
-                    child.text = "http://%s:%s/opt/out/%s/%s" % (self_host, self_port, doc.documentType, doc.id)
+                    if doc.documentType == 'request':
+                        child.text = "http://%s:%s%s/%s" % (self_host, self_port, doc.utmPath, doc.id)
+                    else:
+                        child.text = "http://%s:%s/opt/out/%s/%s" % (self_host, self_port, doc.documentType, doc.id)
                     if len(doc.replyId) > 0:
                         child.set("replyId", doc.replyId)
                 ver = SubElement(top, 'ver')
                 ver.text = '1'
                 self.write(tostring(top))
+
+                self.finish()
+                s.close()
+                return
             else:
                 pattern = re.compile(r"/opt/out/(.*)/(\d+)")
                 path_array = pattern.findall(str(self.path))
 
-                if len(path_array[0]) < 2:
-                    self.setResponseCode(404)
+                if len (path_array) == 1 and len(path_array[0]) == 2:
+                    s = session()
+                    self.setResponseCode(http.OK)
+                    now = datetime.now()
+                    stamp = mktime(now.timetuple())
+                    self.setHeader("Date", format_date_time(stamp))
+                    self.setHeader("Server", "UTM cached proxy")
+
+                    query = s.query(UtmDocument).filter(UtmDocument.id == path_array[0][1],
+                                                        UtmDocument.documentType == path_array[0][0])
+                    if query.count() == 0:
+                        self.setResponseCode(404)
+                        self.finish()
+                        s.close()
+                        return
+                    document = query.one()
+                    if self.method == b'DELETE':
+                        document.archived = True
+                        s.add(document)
+                        s.commit()
+                    else:
+                        self.setHeader("Content-Type", "text/xml;charset=utf-8")
+                        self.setHeader("replyId", document.replyId)
+                        self.write(document.document)
                     self.finish()
                     s.close()
                     return
 
-                query = s.query(UtmDocument).filter(UtmDocument.id == path_array[0][1],
-                                                    UtmDocument.documentType == path_array[0][0])
-                if query.count() == 0:
-                    self.setResponseCode(404)
+        if self.path.startswith(b"/opt/in"):
+            if self.path == b"/opt/in" or self.path == b"/opt/in/":
+                archived = self.args.get(b'archived', [b'0'])[0] == b'1'
+                reply_id = self.args.get(b'replyId', [None])[0]
+                if archived is True or reply_id is not None:
+                    limit = int(self.args.get(b'limit', [0])[0])
+                    offset = int(self.args.get(b'offset', [0])[0])
+                    if limit == 0:
+                        limit = 500
+
+                    s = session()
+                    self.setResponseCode(http.OK)
+                    self.setHeader("Content-Type", "text/xml;charset=utf-8")
+                    now = datetime.now()
+                    stamp = mktime(now.timetuple())
+                    self.setHeader("Date", format_date_time(stamp))
+                    self.setHeader("Server", "UTM cached proxy")
+
+                    top = Element('A')
+                    query = s.query(UtmDocument).filter(UtmDocument.documentType == "request").order_by(
+                        desc(UtmDocument.id))
+                    if reply_id is not None:
+                        query = query.filter(UtmDocument.replyId == reply_id)
+                    if limit > 0:
+                        query = query.limit(limit)
+                    if offset > 0:
+                        query = query.offset(offset)
+                    for doc in query.all():
+                        child = SubElement(top, 'url')
+                        child.text = "http://%s:%s%s/%s" % (self_host, self_port, doc.utmPath, doc.id)
+                        if len(doc.replyId) > 0:
+                            child.set("replyId", doc.replyId)
+                    ver = SubElement(top, 'ver')
+                    ver.text = '1'
+                    self.write(tostring(top))
+
                     self.finish()
                     s.close()
                     return
-                document = query.one()
-                if self.method == b'DELETE':
-                    document.archived = True
-                    s.add(document)
-                    s.commit()
-                else:
+            else:
+                pattern = re.compile(r"/opt/in/(.*)/(\d+)")
+                path_array = pattern.findall(str(self.path))
+                if self.method == b'GET' and len(path_array) == 1 and len(path_array[0]) == 2:
+                    s = session()
+                    self.setResponseCode(http.OK)
+                    self.setHeader("Content-Type", "text/xml;charset=utf-8")
+                    now = datetime.now()
+                    stamp = mktime(now.timetuple())
+                    self.setHeader("Date", format_date_time(stamp))
+                    self.setHeader("Server", "UTM cached proxy")
+                    query = s.query(UtmDocument).filter(UtmDocument.id == path_array[0][1],
+                                                        UtmDocument.documentType == 'request')
+                    if query.count() == 0:
+                        self.setResponseCode(404)
+                        self.finish()
+                        s.close()
+                        return
+                    document = query.one()
+
                     self.setHeader("replyId", document.replyId)
-                    self.write(document.document)
-            self.finish()
-            s.close()
-            return
+                    self.write(document.document.decode('utf-8').encode('iso-8859-1'))
+
+                    self.finish()
+                    s.close()
+
+                    return
 
         # иначе - перенаправляем запрос к реальному УТМ
         self.setHost(bytes(utmHost, "utf-8"), utmPort)
