@@ -8,6 +8,7 @@ import threading
 import time
 import os
 from datetime import datetime, timedelta
+from lxml import etree
 from urllib.request import urlopen, HTTPHandler, build_opener, Request
 from xml.etree import ElementTree as ET
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -219,7 +220,16 @@ class ProxyRequest(http.Request):
                     else:
                         self.setHeader("Content-Type", "text/xml;charset=utf-8")
                         self.setHeader("replyId", document.replyId)
-                        self.write(document.document)
+                        original = self.args.get(b'original', [b'0'])[0] == b'1'
+                        if original is True:
+                            self.write(document.document)
+                        else:
+                            # 1С XDTO factory can't read xml entities with spaces
+                            root = etree.fromstring(document.document)
+                            for elem in root.iter('*'):
+                                if elem.text is not None:
+                                    elem.text = elem.text.strip()
+                            self.write(etree.tostring(root, encoding="utf-8", xml_declaration=True))
                     self.finish()
                     s.close()
                     return
