@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.request import urlopen, HTTPHandler, build_opener, Request
 from xml.etree import ElementTree as ET
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -266,6 +266,7 @@ class ProxyRequest(http.Request):
             else:
                 pattern = re.compile(r"/opt/in/(.*)/(\d+)")
                 path_array = pattern.findall(str(self.path))
+
                 if self.method == b'GET' and len(path_array) == 1 and len(path_array[0]) == 2:
                     s = session()
                     self.setResponseCode(http.OK)
@@ -274,6 +275,7 @@ class ProxyRequest(http.Request):
                     stamp = mktime(now.timetuple())
                     self.setHeader("Date", format_date_time(stamp))
                     self.setHeader("Server", "UTM cached proxy")
+
                     query = s.query(UtmDocument).filter(UtmDocument.id == path_array[0][1],
                                                         UtmDocument.documentType == 'request')
                     if query.count() == 0:
@@ -288,7 +290,6 @@ class ProxyRequest(http.Request):
 
                     self.finish()
                     s.close()
-
                     return
 
         # иначе - перенаправляем запрос к реальному УТМ
@@ -404,6 +405,61 @@ class DownloadThread(threading.Thread):
         s.close()
 
 
+class CleanupThread(threading.Thread):
+    def __init__(self, threadID, name, counter):
+        threading.Thread.__init__(self)
+        self.threadID = threadID
+        self.name = name
+        self.counter = counter
+        self.stop = False
+
+    def periodic(self, s, interval, action, args=()):
+        if not self.stop:
+            s.enter(interval, 1, self.periodic, (s, interval, action, args))
+            try:
+                action(*args)
+            except Exception as e:
+                log.msg("Failed to delete old documents: %s" % sys.exc_info()[0])
+
+    def run(self):
+        log.msg("Starting cleanup thread")
+        scheduler = sched.scheduler(time.time, time.sleep)
+        self.periodic(scheduler, 3600, self.cleanup_documents)
+        scheduler.run(True)
+
+    def cleanup_documents(self):
+        s = session()
+        current_time = datetime.now()
+        two_weeks_ago = current_time - timedelta(weeks=2)
+        three_days_ago = current_time - timedelta(days=3)
+        q = s.query(UtmDocument).filter(UtmDocument.documentType == 'ReplyRests',
+                                        UtmDocument.archived == True)
+        for doc in q.all():
+            s.delete(doc)
+            log.msg("Deleting document %s № %s, replyId = %s" % (doc.documentType, doc.id, doc.replyId))
+        q = s.query(UtmDocument).filter(UtmDocument.documentType == 'INVENTORYREGINFO',
+                                        UtmDocument.ts < three_days_ago)
+        for doc in q.all():
+            s.delete(doc)
+            log.msg("Deleting document %s № %s, replyId = %s" % (doc.documentType, doc.id, doc.replyId))
+        q = s.query(UtmDocument).filter(UtmDocument.ts < two_weeks_ago,
+                                        UtmDocument.archived == True)
+        for doc in q.all():
+            s.delete(doc)
+            log.msg("Deleting document %s № %s, replyId = %s" % (doc.documentType, doc.id, doc.replyId))
+        q = s.query(UtmDocument).filter(UtmDocument.ts < two_weeks_ago,
+                                        UtmDocument.documentType == 'request')
+        for doc in q.all():
+            s.delete(doc)
+            log.msg("Deleting request %s № %s, replyId = %s" % (doc.utmPath, doc.id, doc.replyId))
+        try:
+            s.commit()
+        except:
+            log.msg("Failed to delete documents from database: %s" % sys.exc_info()[0])
+            s.rollback()
+        s.close()
+
+
 class ReactorThread(threading.Thread):
     def __init__(self, threadID, name, counter):
         threading.Thread.__init__(self)
@@ -421,6 +477,7 @@ class AppServerSvc(win32serviceutil.ServiceFramework):
     _svc_name_ = "UtmProxy"
     _svc_display_name_ = "UTM proxy service"
     _svc_description_ = "UTM proxy download all UTM documents to local DB and don't allow UTM to delete them"
+#    _svc_deps_ = ["MSSQLSERVER"]
 
     def __init__(self, args):
         win32serviceutil.ServiceFramework.__init__(self, args)
@@ -464,6 +521,9 @@ class AppServerSvc(win32serviceutil.ServiceFramework):
 
         reactor_thread = ReactorThread(2, "ReactorThread", 1)
         reactor_thread.start()
+
+        cleanup_thread = CleanupThread(3, "CleanupThread", 1)
+        cleanup_thread.start()
 
         while True:
             rc = win32event.WaitForSingleObject(self.hWaitStop, self.timeout)
